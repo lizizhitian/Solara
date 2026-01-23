@@ -15,8 +15,71 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const dbPath = process.env.DB_PATH || 'solara.db';
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'solara.db');//修正了数据库路径，确保在当前目录下创建 solara.db 文件
 const NAS_DOWNLOAD_DIR = process.env.NAS_DOWNLOAD_DIR || path.join(__dirname, 'downloads');
+
+// ======================【新增防风控核心依赖 开始】======================
+const https = require('https');
+const LRU = require('lru-cache');
+const crypto = require('crypto');
+const Semaphore = require('semaphore');
+// ======================【新增防风控核心依赖 结束】======================
+
+// ======================【新增连接池、缓存、限流、并发控制 开始】======================
+// 全局TCP连接池，保障连接复用
+const agent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 5,
+    keepAliveMsecs: 60000
+});
+
+// LRU请求缓存，减少重复请求
+const cache = new LRU({
+    max: 500,
+    ttl: 5 * 60 * 1000
+});
+
+// 并行请求去重容器
+const pending = new Map();
+
+// 最大并发请求数限制
+const semaphore = Semaphore(5);
+
+// 5分钟滑动窗口限流：最多50次请求
+const rateLimit = {
+    window: 300 * 1000,
+    max: 50,
+    list: []
+};
+
+// 限流等待函数
+async function throttle() {
+    const now = Date.now();
+    rateLimit.list = rateLimit.list.filter(t => now - t < rateLimit.window);
+    if (rateLimit.list.length >= rateLimit.max) {
+        await new Promise(r => setTimeout(r, 500));
+        return throttle();
+    }
+    rateLimit.list.push(now);
+}
+
+// 带重试、连接复用的请求函数
+async function fetchWithRetry(url, opts, retries = 3) {
+    await throttle();
+    try {
+        return await axios(url, {
+            ...opts,
+            httpsAgent: agent,
+            httpAgent: agent
+        });
+    } catch (err) {
+        if (retries <= 0 || !err.response || err.response.status < 500) throw err;
+        const delay = Math.min(1000 * (2 ** (3 - retries)) + Math.random() * 500, 30000);
+        await new Promise(r => setTimeout(r, delay));
+        return fetchWithRetry(url, opts, retries - 1);
+    }
+}
+// ======================【新增连接池、缓存、限流、并发控制 结束】======================
 
 // 确保下载目录存在
 if (!fs.existsSync(NAS_DOWNLOAD_DIR)) {
@@ -150,10 +213,11 @@ async function embedMetadata(filePath, song, providedPicUrl) {
         // 1. 获取封面图片
         let imageBuffer = null;
         
-        // 优先使用前端传来的经过代理处理的 URL，如果不可用则回退到拼接 URL
-        const signature = Math.random().toString(36).substring(2, 15);
-        const fallbackPicUrl = `${API_BASE_URL}?types=pic&id=${song.pic_id}&source=${song.source || "netease"}&size=300&s=${signature}`;
-        let picUrl = providedPicUrl || (song.pic_id ? fallbackPicUrl : null);
+        // // 优先使用前端传来的经过代理处理的 URL，如果不可用则回退到拼接 URL
+        // const signature = Math.random().toString(36).substring(2, 15);
+        // const fallbackPicUrl = `${API_BASE_URL}?types=pic&id=${song.pic_id}&source=${song.source || "netease"}&size=300&s=${signature}`;
+        // let picUrl = providedPicUrl || (song.pic_id ? fallbackPicUrl : null);
+        let picUrl = providedPicUrl || null;
 
         // 修复：如果 picUrl 是相对路径（如 /proxy...），转换为绝对路径
         if (picUrl && picUrl.startsWith('/')) {
@@ -219,18 +283,18 @@ async function embedMetadata(filePath, song, providedPicUrl) {
 
         // 2. 获取歌词
         let lyric = '';
-        if (song.lyric_id || song.id) {
-            const signature = Math.random().toString(36).substring(2, 15);
-            const lrcUrl = `${API_BASE_URL}?types=lyric&id=${song.lyric_id || song.id}&source=${song.source || "netease"}&s=${signature}`;
-            try {
-                const lrcRes = await axios.get(lrcUrl, { timeout: 10000 });
-                if (lrcRes.data && lrcRes.data.lyric) {
-                    lyric = lrcRes.data.lyric;
-                }
-            } catch (err) {
-                console.warn('Failed to fetch lyrics:', err.message);
-            }
-        }
+        // if (song.lyric_id || song.id) {
+        //     const signature = Math.random().toString(36).substring(2, 15);
+        //     const lrcUrl = `${API_BASE_URL}?types=lyric&id=${song.lyric_id || song.id}&source=${song.source || "netease"}&s=${signature}`;
+        //     try {
+        //         const lrcRes = await axios.get(lrcUrl, { timeout: 10000 });
+        //         if (lrcRes.data && lrcRes.data.lyric) {
+        //             lyric = lrcRes.data.lyric;
+        //         }
+        //     } catch (err) {
+        //         console.warn('Failed to fetch lyrics:', err.message);
+        //     }
+        // }
 
         const artistStr = Array.isArray(song.artist) ? song.artist.join(', ') : (song.artist || '');
 
@@ -291,49 +355,134 @@ async function embedMetadata(filePath, song, providedPicUrl) {
     }
 }
 
+// app.get('/proxy', async (req, res) => {
+//   const targetUrl = req.query.target;
+
+//   // 处理音频代理 (酷我)
+//   if (targetUrl && targetUrl.includes('kuwo.cn')) {
+//     try {
+//       const response = await fetch(targetUrl, {
+//         headers: {
+//           'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+//           'Referer': 'https://www.kuwo.cn/'
+//         }
+//       });
+//       res.set('Access-Control-Allow-Origin', '*');
+//       res.set('Content-Type', response.headers.get('content-type'));
+//       return response.body.pipe(res);
+//     } catch (error) {
+//       return res.status(500).send('Proxy error');
+//     }
+//   }
+
+//   // 处理 API 代理
+//   const url = new URL(API_BASE_URL);
+//   Object.keys(req.query).forEach(key => {
+//     if (key !== 'target') {
+//       url.searchParams.set(key, req.query[key]);
+//     }
+//   });
+
+//   try {
+//     const response = await fetch(url.toString(), {
+//       headers: {
+//         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+//         'Referer': 'https://music.gdstudio.xyz/'
+//       }
+//     });
+//     const data = await response.text();
+//     res.set('Access-Control-Allow-Origin', '*');
+//     res.set('Content-Type', 'application/json');
+//     res.send(data);
+//   } catch (error) {
+//     res.status(500).send('API Proxy error');
+//   }
+// });
+
+// ==================== 【优化修改】Proxy 接口（仅替换这里，其余完全不变） ====================
 app.get('/proxy', async (req, res) => {
-  const targetUrl = req.query.target;
-  
-  // 处理音频代理 (酷我)
-  if (targetUrl && targetUrl.includes('kuwo.cn')) {
-    try {
-      const response = await fetch(targetUrl, {
-        headers: {
-          'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
-          'Referer': 'https://www.kuwo.cn/'
+    const targetUrl = req.query.target;
+
+    // 处理音频代理 (酷我)
+    if (targetUrl && targetUrl.includes('kuwo.cn')) {
+        try {
+            const response = await fetch(targetUrl, {
+                headers: {
+                    'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+                    'Referer': 'https://www.kuwo.cn/'
+                }
+            });
+            res.set('Access-Control-Allow-Origin', '*');
+            res.set('Content-Type', response.headers.get('content-type'));
+            return response.body.pipe(res);
+        } catch (error) {
+            return res.status(500).send('Proxy error');
         }
-      });
-      res.set('Access-Control-Allow-Origin', '*');
-      res.set('Content-Type', response.headers.get('content-type'));
-      return response.body.pipe(res);
+    }
+
+    // 处理 API 代理
+    try {
+        const urlObj = new URL(API_BASE_URL);
+        Object.keys(req.query).forEach(key => {
+            if (key !== 'target' && key !== 's') urlObj.searchParams.set(key, req.query[key]);
+        });
+
+        const cacheKey = crypto.createHash('md5').update(urlObj.toString()).digest('hex');
+        const type = urlObj.searchParams.get('types');
+
+        // 缓存
+        const cached = cache.get(cacheKey);
+        if (cached) {
+            res.set('Access-Control-Allow-Origin', '*');
+            return res.send(cached);
+        }
+
+        // 去重
+        if (pending.has(cacheKey)) {
+            const result = await pending.get(cacheKey);
+            res.set('Access-Control-Allow-Origin', '*');
+            return res.send(result);
+        }
+
+        // 并发 + 重试 + 连接复用
+        const promise = new Promise((resolve, reject) => {
+            semaphore.take(async () => {
+                try {
+                    const resp = await fetchWithRetry(urlObj.toString(), {
+                        timeout: 15000,
+                        headers: {
+                            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+                            'Accept': 'application/json'
+                        }
+                    });
+                    semaphore.leave();
+                    resolve(resp);
+                } catch (e) {
+                    semaphore.leave();
+                    reject(e);
+                }
+            });
+        });
+
+        pending.set(cacheKey, promise);
+        const response = await promise;
+        const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+
+        // 不缓存播放地址
+        const isValid = response.status === 200 && text.trim() !== '[]' && !text.includes('"error"');
+        const canCache = type !== 'url' && isValid;
+        if (canCache) cache.set(cacheKey, text);
+
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Content-Type', 'application/json');
+        res.send(text);
+        pending.delete(cacheKey);
+
     } catch (error) {
-      return res.status(500).send('Proxy error');
+        res.status(500).send('API Proxy error');
     }
-  }
-
-  // 处理 API 代理
-  const url = new URL(API_BASE_URL);
-  Object.keys(req.query).forEach(key => {
-    if (key !== 'target') {
-      url.searchParams.set(key, req.query[key]);
-    }
-  });
-
-  try {
-    const response = await fetch(url.toString(), {
-      headers: {
-        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
-        'Referer': 'https://music.gdstudio.xyz/'
-      }
-    });
-    const data = await response.text();
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Content-Type', 'application/json');
-    res.send(data);
-  } catch (error) {
-    res.status(500).send('API Proxy error');
-  }
 });
+// ==================== 【优化修改】结束 ====================
 
 // 调色板接口 (Palette)
 app.get('/palette', async (req, res) => {
