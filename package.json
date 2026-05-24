@@ -19,6 +19,7 @@
     "metaflac-js": "^1.0.5",
     "music-metadata": "^11.10.6",
     "node-fetch": "^2.7.0",
-    "node-id3": "^0.2.9"
+    "node-id3": "^0.2.9",
+    "lru-cache": "^10.0.0"
   }
 }
