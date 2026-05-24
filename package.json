@@ -20,6 +20,7 @@
     "music-metadata": "^11.10.6",
     "node-fetch": "^2.7.0",
     "node-id3": "^0.2.9",
-    "lru-cache": "^10.0.0"
+    "lru-cache": "^10.4.3",
+    "semaphore": "^1.1.0"
   }
 }
