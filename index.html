@@ -111,6 +111,9 @@
             </button>
             <div class="mobile-toolbar__title" id="mobileToolbarTitle">Solara</div>
             <div class="mobile-toolbar__actions">
+                <button class="mobile-toolbar__button" id="metricsToggleButtonMobile" type="button" aria-label="查看 API 连接统计">
+                    <i class="fas fa-chart-line" aria-hidden="true"></i>
+                </button>
                 <button class="mobile-toolbar__button" id="mobileSearchToggle" type="button" aria-label="打开搜索">
                     <i class="fas fa-search" aria-hidden="true"></i>
                 </button>
@@ -119,11 +122,16 @@
         <div class="header">
             <h1>Solara</h1>
             <div class="warning">免费API来自GD音乐台(music.gdstudio.xyz)</div>
-            <div class="theme-switch-wrapper">
-                <button id="themeToggleButton" class="theme-toggle-button" type="button" aria-label="切换深浅色模式">
-                    <i class="fas fa-sun theme-icon theme-icon--sun" aria-hidden="true"></i>
-                    <i class="fas fa-moon theme-icon theme-icon--moon" aria-hidden="true"></i>
+            <div class="header-actions">
+                <button id="metricsToggleButton" class="metrics-toggle-button" type="button" aria-label="查看 API 连接统计">
+                    <i class="fas fa-chart-line" aria-hidden="true"></i>
                 </button>
+                <div class="theme-switch-wrapper">
+                    <button id="themeToggleButton" class="theme-toggle-button" type="button" aria-label="切换深浅色模式">
+                        <i class="fas fa-sun theme-icon theme-icon--sun" aria-hidden="true"></i>
+                        <i class="fas fa-moon theme-icon theme-icon--moon" aria-hidden="true"></i>
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -160,6 +168,10 @@
             </div>
             <div id="searchResults" class="search-results">
                 <div class="search-results-toolbar">
+                    <button id="metricsToggleButtonInline" class="metrics-inline-button" type="button" aria-label="查看 API 连接统计">
+                        <i class="fas fa-chart-line" aria-hidden="true"></i>
+                        <span>查看API连接统计</span>
+                    </button>
                     <button id="selectAllBtn" class="select-all-btn" type="button" disabled>
                         <i class="fas fa-check-double" aria-hidden="true"></i>
                         <span>全选</span>

@@ -3,12 +3,15 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
-const fetch = require('node-fetch');
+//const fetch = require('node-fetch');
 const fs = require('fs');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const pipelineAsync = promisify(pipeline);
 const axios = require('axios');
 const NodeID3 = require('node-id3');
 const MetaFlac = require('metaflac-js');
-const mm = require('music-metadata');
+//const mm = require('music-metadata');
 // const ffmpeg = require('fluent-ffmpeg'); // 移除 ffmpeg 依赖
 const { buildPalette } = require('./lib/palette');
 require('dotenv').config();
@@ -19,22 +22,70 @@ const dbPath = process.env.DB_PATH || path.join(__dirname, 'solara.db');//修正
 const NAS_DOWNLOAD_DIR = process.env.NAS_DOWNLOAD_DIR || path.join(__dirname, 'downloads');
 
 // ======================【新增防风控核心依赖 开始】======================
+const http = require('http');
 const https = require('https');
-const LRU = require('lru-cache');
+const {LRUCache} = require('lru-cache');
 const crypto = require('crypto');
 const Semaphore = require('semaphore');
 // ======================【新增防风控核心依赖 结束】======================
 
 // ======================【新增连接池、缓存、限流、并发控制 开始】======================
 // 全局TCP连接池，保障连接复用
-const agent = new https.Agent({
+const defaultAgentOptions = {
     keepAlive: true,
-    maxSockets: 5,
+    maxSockets: 20,
     keepAliveMsecs: 60000
+};
+
+const defaultAgent = new https.Agent(defaultAgentOptions);
+const agentCache = new Map();
+function getAgentForUrl(urlString) {
+    try {
+        const urlObj = new URL(urlString);
+        const key = `${urlObj.protocol}//${urlObj.hostname}`;
+        if (agentCache.has(key)) return agentCache.get(key);
+
+        const agentOptions = {
+            keepAlive: true,
+            maxSockets: urlObj.hostname.includes('gdstudio.xyz') ? 40 : 20,
+            keepAliveMsecs: 60000,
+            maxFreeSockets: 10,
+        };
+
+        const agent = urlObj.protocol === 'https:' ? new https.Agent(agentOptions) : new http.Agent(agentOptions);
+        agentCache.set(key, agent);
+        return agent;
+    } catch (err) {
+        return defaultAgent;
+    }
+}
+
+// 复用的 axios 实例，统一配置 agent 与超时
+const axiosInstance = axios.create({
+    httpAgent: defaultAgent,
+    httpsAgent: defaultAgent,
+    timeout: 20000,
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Solara/1.0)'
+    },
+    responseType: 'json',
 });
 
+const metrics = {
+    apiRequests: 0,
+    upstreamRequests: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    pendingHits: 0,
+    retryCount: 0,
+    successfulRequests: 0,
+    failedRequests: 0,
+    activeRequests: 0,
+    totalResponseTimeMs: 0,
+};
+
 // LRU请求缓存，减少重复请求
-const cache = new LRU({
+const cache = new LRUCache({
     max: 500,
     ttl: 5 * 60 * 1000
 });
@@ -66,17 +117,28 @@ async function throttle() {
 // 带重试、连接复用的请求函数
 async function fetchWithRetry(url, opts, retries = 3) {
     await throttle();
+    const startTime = Date.now();
+    metrics.upstreamRequests += 1;
+    metrics.activeRequests += 1;
+    const agent = getAgentForUrl(url);
+
     try {
-        return await axios(url, {
-            ...opts,
-            httpsAgent: agent,
-            httpAgent: agent
-        });
+        const response = await axiosInstance.request({ url, httpAgent: agent, httpsAgent: agent, ...opts });
+        const duration = Date.now() - startTime;
+        metrics.successfulRequests += 1;
+        metrics.totalResponseTimeMs += duration;
+        return response;
     } catch (err) {
-        if (retries <= 0 || !err.response || err.response.status < 500) throw err;
-        const delay = Math.min(1000 * (2 ** (3 - retries)) + Math.random() * 500, 30000);
-        await new Promise(r => setTimeout(r, delay));
-        return fetchWithRetry(url, opts, retries - 1);
+        if (retries > 0 && err.response && err.response.status >= 500) {
+            metrics.retryCount += 1;
+            const delay = Math.min(1000 * (2 ** (3 - retries)) + Math.random() * 500, 30000);
+            await new Promise(r => setTimeout(r, delay));
+            return fetchWithRetry(url, opts, retries - 1);
+        }
+        metrics.failedRequests += 1;
+        throw err;
+    } finally {
+        metrics.activeRequests -= 1;
     }
 }
 // ======================【新增连接池、缓存、限流、并发控制 结束】======================
@@ -270,10 +332,10 @@ async function embedMetadata(filePath, song, providedPicUrl) {
                     }
                 }
 
-                if (buffer.length > 1000) {
-                    imageBuffer = buffer;
-                    fs.writeFileSync(tempCoverPath, imageBuffer);
-                } else {
+                    if (buffer.length > 1000) {
+                        imageBuffer = buffer;
+                        await fs.promises.writeFile(tempCoverPath, imageBuffer);
+                    } else {
                     console.warn(`Invalid cover image data: ${buffer.length} bytes.`);
                 }
             } catch (err) {
@@ -322,7 +384,12 @@ async function embedMetadata(filePath, song, providedPicUrl) {
                 include: ['TALB', 'TIT2', 'TPE1', 'USLT', 'APIC'],
                 noAutoTag: false
             };
-            const success = NodeID3.write(tags, filePath);
+            try {
+                const success = NodeID3.write(tags, filePath, options);
+                if (!success) console.warn('NodeID3.write returned false or failed to write tags');
+            } catch (id3Err) {
+                console.error('ID3 write failed:', id3Err && id3Err.message ? id3Err.message : id3Err);
+            }
         } else if (fileExt === '.flac') {
             try {
                 const flac = new MetaFlac(filePath);
@@ -414,9 +481,11 @@ app.get('/proxy', async (req, res) => {
             });
             res.set('Access-Control-Allow-Origin', '*');
             res.set('Content-Type', response.headers.get('content-type'));
-            return response.body.pipe(res);
+            await pipelineAsync(response.body, res);
+            return;
         } catch (error) {
-            return res.status(500).send('Proxy error');
+            console.error('API Proxy error (kuwo):', error && error.message ? error.message : error);
+            res.status(500).json({ error: 'API Proxy error', message: error && error.message ? error.message : String(error) });
         }
     }
 
@@ -429,16 +498,20 @@ app.get('/proxy', async (req, res) => {
 
         const cacheKey = crypto.createHash('md5').update(urlObj.toString()).digest('hex');
         const type = urlObj.searchParams.get('types');
+        metrics.apiRequests += 1;
 
         // 缓存
         const cached = cache.get(cacheKey);
         if (cached) {
+            metrics.cacheHits += 1;
             res.set('Access-Control-Allow-Origin', '*');
             return res.send(cached);
         }
+        metrics.cacheMisses += 1;
 
         // 去重
         if (pending.has(cacheKey)) {
+            metrics.pendingHits += 1;
             const result = await pending.get(cacheKey);
             res.set('Access-Control-Allow-Origin', '*');
             return res.send(result);
@@ -455,16 +528,17 @@ app.get('/proxy', async (req, res) => {
                             'Accept': 'application/json'
                         }
                     });
-                    semaphore.leave();
                     resolve(resp);
                 } catch (e) {
-                    semaphore.leave();
                     reject(e);
+                } finally {
+                    semaphore.leave();
                 }
             });
         });
 
         pending.set(cacheKey, promise);
+        promise.finally(() => pending.delete(cacheKey));
         const response = await promise;
         const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
 
@@ -476,7 +550,7 @@ app.get('/proxy', async (req, res) => {
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Content-Type', 'application/json');
         res.send(text);
-        pending.delete(cacheKey);
+        //pending.delete(cacheKey);
 
     } catch (error) {
         res.status(500).send('API Proxy error');
@@ -485,6 +559,28 @@ app.get('/proxy', async (req, res) => {
 // ==================== 【优化修改】结束 ====================
 
 // 调色板接口 (Palette)
+app.get('/api/metrics', (req, res) => {
+    const averageResponseTimeMs = metrics.successfulRequests > 0
+        ? Math.round(metrics.totalResponseTimeMs / metrics.successfulRequests)
+        : 0;
+
+    res.json({
+        apiRequests: metrics.apiRequests,
+        upstreamRequests: metrics.upstreamRequests,
+        cacheHits: metrics.cacheHits,
+        cacheMisses: metrics.cacheMisses,
+        pendingHits: metrics.pendingHits,
+        retryCount: metrics.retryCount,
+        successfulRequests: metrics.successfulRequests,
+        failedRequests: metrics.failedRequests,
+        activeRequests: metrics.activeRequests,
+        cacheSize: cache.size,
+        pendingCount: pending.size,
+        averageResponseTimeMs,
+        agentPools: Array.from(agentCache.keys()),
+    });
+});
+
 app.get('/palette', async (req, res) => {
     const imageUrl = req.query.image || req.query.url;
     if (!imageUrl) return res.status(400).send('Missing image URL');
@@ -524,20 +620,17 @@ app.post('/api/nas-download', async (req, res) => {
 
         const filePath = path.join(NAS_DOWNLOAD_DIR, safeFilename);
         const fileStream = fs.createWriteStream(filePath);
-        
-        response.body.pipe(fileStream);
-
-        fileStream.on('finish', async () => {
+        try {
+            await pipelineAsync(response.body, fileStream);
             // 嵌入元数据，增加 picUrl 参数
             await embedMetadata(filePath, song, picUrl);
-            
             res.json({ success: true, path: filePath });
-        });
-
-        fileStream.on('error', (err) => {
-            console.error('File stream error:', err);
+        } catch (err) {
+            console.error('NAS file stream or metadata error:', err && err.message ? err.message : err);
+            // 清理可能存在的残留文件
+            try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch(e){}
             res.status(500).json({ error: 'Failed to save file to NAS' });
-        });
+        }
     } catch (error) {
         console.error('NAS download failed:', error);
         res.status(500).json({ error: 'Failed to download file to NAS' });
@@ -551,12 +644,15 @@ app.post('/api/download', async (req, res) => {
         return res.status(400).json({ error: 'Missing url or filename' });
     }
 
+    // 清洗文件名，防止非法字符（尤其是 /）导致路径解析错误
+    const safeFilename = filename.replace(/[\/\\?%*:|"<>]/g, '-');
+
     const tempDir = path.join(__dirname, 'temp_downloads');
     if (!fs.existsSync(tempDir)) {
         fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    const tempFilePath = path.join(tempDir, `${Date.now()}_${filename}`);
+    const tempFilePath = path.join(tempDir, `${Date.now()}_${safeFilename}`);
     
     try {
         // 1. 下载原始音频文件
@@ -572,18 +668,21 @@ app.post('/api/download', async (req, res) => {
         });
 
         const writer = fs.createWriteStream(tempFilePath);
-        response.data.pipe(writer);
-
-        await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+        try {
+            await pipelineAsync(response.data, writer);
+        } catch (streamErr) {
+            console.error('Error writing temp file stream:', streamErr && streamErr.message ? streamErr.message : streamErr);
+            if (fs.existsSync(tempFilePath)) {
+                try { fs.unlinkSync(tempFilePath); } catch(e){}
+            }
+            return res.status(500).json({ error: 'Failed to download file' });
+        }
 
         // 2. 嵌入元数据
         await embedMetadata(tempFilePath, song, picUrl);
 
         // 3. 发送文件给浏览器
-        res.download(tempFilePath, filename, (err) => {
+        res.download(tempFilePath, safeFilename, (err) => {
             if (err) {
                 console.error('Error sending file:', err);
             }

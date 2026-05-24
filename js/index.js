@@ -33,6 +33,9 @@ const dom = {
     currentSongTitle: document.getElementById("currentSongTitle"),
     currentSongArtist: document.getElementById("currentSongArtist"),
     debugInfo: document.getElementById("debugInfo"),
+    metricsToggleButton: document.getElementById("metricsToggleButton"),
+    metricsToggleButtonMobile: document.getElementById("metricsToggleButtonMobile"),
+    metricsToggleButtonInline: document.getElementById("metricsToggleButtonInline"),
     importSelectedBtn: document.getElementById("importSelectedBtn"),
     importSelectedCount: document.getElementById("importSelectedCount"),
     importSelectedMenu: document.getElementById("importSelectedMenu"),
@@ -117,6 +120,36 @@ const dom = {
 };
 
 window.SolaraDom = dom;
+
+// 安全工具：HTML 转义，防止 XSS
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>\"'`=\/]/g, function (c) {
+        return ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;',
+            '/': '&#x2F;',
+            '`': '&#x60;',
+            '=': '&#x3D;'
+        })[c] || c;
+    });
+}
+
+// 安全工具：仅允许安全的图片 URL（http/https 或 data:image/*），否则返回空字符串
+function sanitizeImageUrl(raw) {
+    if (!raw || typeof raw !== 'string') return '';
+    raw = raw.trim();
+    try {
+        if (/^data:image\//i.test(raw)) return raw;
+        const u = new URL(raw, window.location.href);
+        if (u.protocol === 'http:' || u.protocol === 'https:') return u.href;
+    } catch (e) {
+        // ignore
+    }
+    return '';
+}
 
 const isMobileView = Boolean(window.__SOLARA_IS_MOBILE);
 
@@ -958,6 +991,11 @@ const API = {
     getPicUrl: (song) => {
         const signature = API.generateSignature();
         return `${API.baseUrl}?types=pic&id=${song.pic_id}&source=${song.source || "netease"}&size=300&s=${signature}`;
+    },
+
+    metrics: async () => {
+        const signature = API.generateSignature();
+        return API.fetchJson(`/api/metrics?s=${signature}`);
     }
 };
 
@@ -1887,7 +1925,8 @@ function showAlbumCoverPlaceholder() {
 }
 
 function setAlbumCoverImage(url) {
-    const safeUrl = toAbsoluteUrl(preferHttpsUrl(url));
+    const sanitized = sanitizeImageUrl(preferHttpsUrl(url));
+    const safeUrl = sanitized || toAbsoluteUrl('/favicon.png');
     state.currentArtworkUrl = safeUrl;
     dom.albumCover.innerHTML = `<img src="${safeUrl}" alt="专辑封面">`;
     dom.albumCover.classList.remove("loading");
@@ -2018,16 +2057,98 @@ function saveFavoriteState(options = {}) {
 }
 
 // 调试日志函数
+let debugMetricsInterval = null;
+
+function renderDebugMetrics(metrics) {
+    if (!dom.debugInfo) return;
+
+    let metricsPanel = dom.debugInfo.querySelector('.debug-metrics-panel');
+    if (!metricsPanel) {
+        metricsPanel = document.createElement('div');
+        metricsPanel.className = 'debug-metrics-panel';
+        dom.debugInfo.insertBefore(metricsPanel, dom.debugInfo.firstChild);
+    }
+
+    metricsPanel.innerHTML = `
+        <div><strong>API 连接统计</strong></div>
+        <div>本地请求数: ${metrics.apiRequests}</div>
+        <div>上游请求数: ${metrics.upstreamRequests}</div>
+        <div>缓存命中: ${metrics.cacheHits}</div>
+        <div>缓存未命中: ${metrics.cacheMisses}</div>
+        <div>去重命中: ${metrics.pendingHits}</div>
+        <div>重试次数: ${metrics.retryCount}</div>
+        <div>成功请求: ${metrics.successfulRequests}</div>
+        <div>失败请求: ${metrics.failedRequests}</div>
+        <div>活跃请求: ${metrics.activeRequests}</div>
+        <div>平均响应时长: ${metrics.averageResponseTimeMs} ms</div>
+        <div>缓存条目: ${metrics.cacheSize}</div>
+        <div>待处理条目: ${metrics.pendingCount}</div>
+        <div>Agent 池: ${metrics.agentPools.length}</div>
+    `;
+}
+
+async function fetchAndRenderDebugMetrics() {
+    if (!state.debugMode) return;
+    try {
+        const metrics = await API.metrics();
+        renderDebugMetrics(metrics);
+    } catch (error) {
+        console.warn('获取调试指标失败', error);
+    }
+}
+
+function startDebugMetricsPolling() {
+    if (debugMetricsInterval) return;
+    fetchAndRenderDebugMetrics();
+    debugMetricsInterval = setInterval(fetchAndRenderDebugMetrics, 15000);
+}
+
+function stopDebugMetricsPolling() {
+    if (debugMetricsInterval) {
+        clearInterval(debugMetricsInterval);
+        debugMetricsInterval = null;
+    }
+}
+
+function setDebugMode(enabled) {
+    state.debugMode = enabled;
+    if (state.debugMode) {
+        dom.debugInfo.classList.add("show");
+        debugLog("调试模式已启用");
+        startDebugMetricsPolling();
+        if (dom.metricsToggleButton) {
+            dom.metricsToggleButton.classList.add('active');
+        }
+        if (dom.metricsToggleButtonMobile) {
+            dom.metricsToggleButtonMobile.classList.add('active');
+        }
+    } else {
+        dom.debugInfo.classList.remove("show");
+        stopDebugMetricsPolling();
+        if (dom.metricsToggleButton) {
+            dom.metricsToggleButton.classList.remove('active');
+        }
+        if (dom.metricsToggleButtonMobile) {
+            dom.metricsToggleButtonMobile.classList.remove('active');
+        }
+    }
+}
+
 function debugLog(message) {
     if (state.debugMode) {
         console.log(`[DEBUG] ${message}`);
         const debugInfo = dom.debugInfo;
         const entry = document.createElement("div");
         entry.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+        entry.className = 'debug-log-entry';
         debugInfo.appendChild(entry);
 
-        while (debugInfo.childNodes.length > 50) {
-            debugInfo.removeChild(debugInfo.firstChild);
+        const metricsPanel = debugInfo.querySelector('.debug-metrics-panel');
+        const maxEntries = metricsPanel ? 51 : 50;
+        while (debugInfo.childNodes.length > maxEntries) {
+            const firstEntry = debugInfo.querySelector('.debug-log-entry');
+            if (!firstEntry) break;
+            debugInfo.removeChild(firstEntry);
         }
 
         debugInfo.classList.add("show");
@@ -2035,17 +2156,23 @@ function debugLog(message) {
     }
 }
 
+function toggleDebugMode() {
+    setDebugMode(!state.debugMode);
+}
+
 // 启用调试模式（按Ctrl+D）
 document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key === "d") {
         e.preventDefault();
-        state.debugMode = !state.debugMode;
-        if (state.debugMode) {
-            dom.debugInfo.classList.add("show");
-            debugLog("调试模式已启用");
-        } else {
-            dom.debugInfo.classList.remove("show");
-        }
+        toggleDebugMode();
+    }
+});
+
+[dom.metricsToggleButton, dom.metricsToggleButtonMobile, dom.metricsToggleButtonInline].forEach(button => {
+    if (button) {
+        button.addEventListener('click', () => {
+            toggleDebugMode();
+        });
     }
 });
 
@@ -4515,9 +4642,9 @@ function showDownloadErrorModal(errorSongs, actionText = "下载") {
                 <i class="fas fa-exclamation-circle"></i>
             </div>
             <div class="download-error-info">
-                <div class="download-error-name">${song.name || "未知歌曲"}</div>
-                <div class="download-error-artist">${song.artist || "未知艺术家"}</div>
-                <div class="download-error-msg">${errorMsg}</div>
+                <div class="download-error-name">${escapeHtml(song.name || "未知歌曲")}</div>
+                <div class="download-error-artist">${escapeHtml(song.artist || "未知艺术家")}</div>
+                <div class="download-error-msg">${escapeHtml(errorMsg)}</div>
             </div>
         `;
         dom.downloadErrorList.appendChild(item);
@@ -5203,8 +5330,8 @@ function renderPlaylist() {
             : (song.artist || "未知艺术家");
         const songKey = getSongKey(song) || `playlist-${index}`;
         return `
-        <div class="playlist-item" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
-            ${song.name} - ${artistValue}
+        <div class="playlist-item" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${escapeHtml(song.name)}" data-favorite-key="${escapeHtml(songKey)}">
+            ${escapeHtml(song.name)} - ${escapeHtml(artistValue)}
             <button class="playlist-item-favorite action-btn favorite favorite-toggle" type="button" data-playlist-action="favorite" data-index="${index}" data-favorite-key="${songKey}" title="收藏" aria-label="收藏">
                 <i class="fa-regular fa-heart"></i>
             </button>
@@ -5472,8 +5599,8 @@ function renderFavorites() {
         const isCurrent = state.currentList === "favorite" && index === state.currentFavoriteIndex;
         const songKey = getSongKey(song) || `favorite-${index}`;
         return `
-        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
-            ${song.name} - ${artistValue}
+        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${escapeHtml(song.name)}" data-favorite-key="${escapeHtml(songKey)}">
+            ${escapeHtml(song.name)} - ${escapeHtml(artistValue)}
             <button class="favorite-item-action favorite-item-action--add" type="button" data-favorite-action="add" data-index="${index}" title="添加到播放列表" aria-label="添加到播放列表">
                 <i class="fas fa-plus"></i>
             </button>
@@ -6404,12 +6531,12 @@ function showDiscoveryPreview(songs, genre) {
         infoContainer.textContent = `本次为您随机探索到 ${songs.length} 首「${genre}」风格的歌曲：`;
     }
 
-    // 渲染歌曲列表
+    // 渲染歌曲列表（使用 escapeHtml 防止 XSS）
     listContainer.innerHTML = songs.map(song => `
         <div class="discovery-song-item">
             <div class="discovery-song-info">
-                <span class="discovery-song-name">${song.name}</span>
-                <span class="discovery-song-artist">${song.artist}</span>
+                <span class="discovery-song-name">${escapeHtml(song.name)}</span>
+                <span class="discovery-song-artist">${escapeHtml(song.artist)}</span>
             </div>
         </div>
     `).join("");
@@ -6561,7 +6688,7 @@ function clearLyricsIfLibraryEmpty() {
 // 修复：显示歌词
 function displayLyrics() {
     const lyricsHtml = state.lyricsData.map((lyric, index) =>
-        `<div data-time="${lyric.time}" data-index="${index}">${lyric.text}</div>`
+        `<div data-time="${lyric.time}" data-index="${index}">${escapeHtml(lyric.text)}</div>`
     ).join("");
     setLyricsContentHtml(lyricsHtml);
     if (dom.lyrics) {

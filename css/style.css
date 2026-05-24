@@ -162,6 +162,63 @@ body.background-transitioning .background-stage__layer--transition {
     margin-top: 10px; 
     font-style: italic; 
 }
+.header-actions {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.metrics-toggle-button {
+    width: 44px;
+    height: 44px;
+    border-radius: 16px;
+    border: 1px solid var(--border-color);
+    background: linear-gradient(160deg, rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.4));
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease, background 0.3s ease;
+    position: relative;
+    overflow: hidden;
+    color: var(--primary-color);
+}
+.metrics-toggle-button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 26px rgba(0, 0, 0, 0.16);
+}
+.metrics-toggle-button.active {
+    border-color: var(--primary-color);
+    box-shadow: 0 10px 24px rgba(26, 188, 156, 0.18);
+}
+.metrics-inline-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border-color);
+    background: var(--component-bg);
+    color: var(--primary-color);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.25s ease, box-shadow 0.25s ease, transform 0.25s ease;
+}
+.metrics-inline-button:hover {
+    background: rgba(255, 255, 255, 0.12);
+    transform: translateY(-1px);
+}
+.metrics-inline-button:active {
+    transform: translateY(0);
+}
+.metrics-inline-button i {
+    font-size: 0.95rem;
+}
 
 /* 搜索区域样式 - 增强动效 */
 .search-area {
@@ -2419,11 +2476,9 @@ input[type="range"]:active::-moz-range-thumb {
 }
 
 .theme-switch-wrapper {
-    position: absolute;
-    top: 0px;
-    right: 0px;
     display: flex;
-    justify-content: flex-end;
+    justify-content: center;
+    align-items: center;
 }
 
 .theme-toggle-button {
